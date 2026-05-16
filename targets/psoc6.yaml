@@ -1,0 +1,24 @@
+id: psoc6
+name: Infineon PSoC 6
+vendor: Infineon Technologies
+core: cortex-m4
+architecture: armv7e-m
+fpu: true
+npu: false
+coprocessor: cortex-m0plus
+memory:
+  ram_kb: 288
+  flash_kb: 2048
+inference:
+  runtime: tflite-micro
+  cmsis_nn: true
+  arena_default_kb: 80
+toolchain:
+  compiler: arm-none-eabi-gcc
+  flags: "-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb"
+rtos:
+  freertos: true
+  zephyr: true
+  threadx: true
+notes: >
+  Dual-core (M4 + M0+). Run inference on M4, sensors/BLE on M0+.

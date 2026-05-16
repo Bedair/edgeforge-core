@@ -1,0 +1,25 @@
+id: nrf52840
+name: Nordic nRF52840 (Arduino Nano 33 BLE Sense)
+vendor: Nordic Semiconductor
+core: cortex-m4f
+architecture: armv7e-m
+fpu: true
+npu: false
+memory:
+  ram_kb: 256
+  flash_kb: 1024
+inference:
+  runtime: tflite-micro
+  cmsis_nn: true
+  arena_default_kb: 64
+toolchain:
+  compiler: arm-none-eabi-gcc
+  flags: "-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb"
+rtos:
+  freertos: true
+  zephyr: true
+sensors:
+  imu: LSM9DS1
+  microphone: MP34DT05
+notes: >
+  Most popular TinyML dev board. Rich sensors ideal for audio and motion demos.
