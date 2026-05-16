@@ -1,32 +1,37 @@
-"""
-EdgeForge CLI — main entry point.
-"""
+"""EdgeForge CLI — main entry point."""
 
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
+
+# Fix Windows Unicode encoding for terminals that don't support UTF-8
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 import click
 from rich.console import Console
-from rich.table import Table
-from rich import box
-from rich.panel import Panel
-from rich.columns import Columns
-from rich import print as rprint
+from rich.table   import Table
+from rich         import box
 
-console = Console()
+# Force rich to use ASCII-safe mode on Windows legacy terminals
+_FORCE_TERMINAL = sys.platform != "win32" or os.environ.get("WT_SESSION") or os.environ.get("TERM")
+console = Console(highlight=False, emoji=False)
+
+# ASCII-safe status icons (work on all Windows terminals)
+OK   = "[OK]"
+FAIL = "[FAIL]"
+WARN = "[WARN]"
 
 
 @click.group()
 @click.version_option(package_name="edgeforge")
 def main():
-    """
-    ⚒  EdgeForge — forge your models into firmware.
-
-    Takes any trained AI model and generates production-ready
-    C/C++ code for your target MCU.
-    """
+    """EdgeForge -- forge your models into firmware."""
     pass
 
 
@@ -34,192 +39,129 @@ def main():
 
 @main.command()
 @click.argument("model_path", type=click.Path(exists=True))
-@click.option(
-    "--mcu", default=None,
-    help="Filter compatibility report to a specific MCU (e.g. stm32f407). "
-         "Omit to show all known targets."
-)
+@click.option("--mcu",      default=None, help="Filter to a specific MCU.")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
 def analyze(model_path: str, mcu: str | None, as_json: bool):
-    """
-    Analyze a model — detect format, extract graph info, estimate RAM/flash,
-    and show compatibility with your target MCU(s).
-
-    MODEL_PATH can be a .tflite, .onnx, .pt, .pth, .pb file,
-    or a TensorFlow SavedModel directory.
-    """
-    from .converter.detector import detect, describe, ModelFormat
-    from .converter.to_onnx import to_onnx, ConversionError
-    from .converter.analyzer import analyze as _analyze
-    from .targets.loader import (
-        load_target, check_compatibility, check_all_targets,
-        FitStatus, all_targets,
+    """Analyze a model -- format, graph, RAM/flash estimate, board compatibility."""
+    from edgeforge.converter.detector import detect, describe, ModelFormat
+    from edgeforge.converter.to_onnx  import to_onnx, ConversionError
+    from edgeforge.converter.analyzer import analyze as _analyze
+    from edgeforge.targets.loader     import (
+        load_target, check_compatibility, check_all_targets, FitStatus,
     )
 
     p = Path(model_path)
+    console.rule("EdgeForge Analyze")
 
-    # ── Step 1: Detect format ────────────────────────────────────────────────
-    console.rule("[bold]EdgeForge Analyze[/bold]")
-    with console.status(f"Detecting format of [cyan]{p.name}[/cyan]..."):
+    with console.status(f"Detecting format of {p.name}..."):
         info = describe(p)
         fmt  = info["format"]
 
-    _fmt_colors = {
-        "tflite":      "green",
-        "onnx":        "blue",
-        "torchscript": "yellow",
-        "tf_savedmodel": "magenta",
-        "tf_frozen":   "magenta",
-        "unknown":     "red",
-    }
-    color = _fmt_colors.get(fmt.value, "white")
-
     console.print(
-        f"\n[bold]Model:[/bold]  {p.name}  "
-        f"[dim]({info['size_human']})[/dim]\n"
-        f"[bold]Format:[/bold] [{color}]{fmt.value.upper()}[/{color}]"
+        f"\nModel:  {p.name}  ({info['size_human']})\n"
+        f"Format: {fmt.value.upper()}"
     )
 
     if fmt == ModelFormat.UNKNOWN:
-        console.print(
-            "[red]✗[/red] Could not detect model format. "
-            "Ensure the file is a valid .tflite, .onnx, .pt, .pb, "
-            "or SavedModel directory."
-        )
+        console.print(f"{FAIL} Cannot detect format. Supported: .tflite .onnx .pt .pb SavedModel")
         sys.exit(1)
 
-    # ── Step 2: Convert to ONNX IR ───────────────────────────────────────────
     if fmt == ModelFormat.ONNX:
         onnx_path = p
-        console.print("[green]✓[/green] Already in ONNX format — skipping conversion.")
+        console.print(f"{OK} Already ONNX -- skipping conversion.")
     else:
-        with console.status(f"Converting to ONNX IR..."):
+        with console.status("Converting to ONNX IR..."):
             try:
                 onnx_path = to_onnx(p)
-                console.print(f"[green]✓[/green] Converted to ONNX IR")
+                console.print(f"{OK} Converted to ONNX IR")
             except ConversionError as e:
-                console.print(f"[red]✗ Conversion failed:[/red] {e}")
+                console.print(f"{FAIL} Conversion failed: {e}")
                 sys.exit(1)
 
-    # ── Step 3: Analyze ONNX graph ───────────────────────────────────────────
     with console.status("Analyzing model graph..."):
         try:
             result = _analyze(onnx_path, original_format=fmt.value)
         except Exception as e:
-            console.print(f"[red]✗ Analysis failed:[/red] {e}")
+            console.print(f"{FAIL} Analysis failed: {e}")
             sys.exit(1)
 
-    # ── Operator summary ─────────────────────────────────────────────────────
     console.print()
-    console.rule("[dim]Graph Summary[/dim]")
-
+    console.rule("Graph Summary")
     op_str = "  ".join(
-        f"[cyan]{op}[/cyan] ×{count}"
+        f"{op} x{count}"
         for op, count in sorted(result.op_counts.items(), key=lambda x: -x[1])
     )
-    console.print(f"[bold]Operators:[/bold] {result.total_ops} total")
-    console.print(f"  {op_str}")
-    console.print(f"[bold]Parameters:[/bold] {result.parameter_count:,}")
+    console.print(f"Operators:  {result.total_ops} total\n  {op_str}")
+    console.print(f"Parameters: {result.parameter_count:,}")
 
-    # Input / output tensors
     console.print()
     for ti in result.input_tensors:
-        shape_str = " × ".join(str(d) for d in ti.shape)
         console.print(
-            f"[bold]Input:[/bold]  [cyan]{ti.name}[/cyan]  "
-            f"[dim]{shape_str}  {ti.dtype}  {ti.bytes / 1024:.1f} KB[/dim]"
+            f"Input:  {ti.name}  "
+            f"({' x '.join(str(d) for d in ti.shape)}  {ti.dtype})"
         )
     for ti in result.output_tensors:
-        shape_str = " × ".join(str(d) for d in ti.shape)
         console.print(
-            f"[bold]Output:[/bold] [cyan]{ti.name}[/cyan]  "
-            f"[dim]{shape_str}  {ti.dtype}  {ti.bytes / 1024:.1f} KB[/dim]"
+            f"Output: {ti.name}  "
+            f"({' x '.join(str(d) for d in ti.shape)}  {ti.dtype})"
         )
 
-    # Memory estimates
     console.print()
-    console.rule("[dim]Memory Estimates[/dim]")
+    console.rule("Memory Estimates")
     console.print(
-        f"[bold]Flash (weights, INT8):[/bold]  {result.flash_kb:.1f} KB\n"
-        f"[bold]RAM   (peak activation):[/bold] {result.ram_kb:.1f} KB\n"
-        f"[bold]Arena (TFLite Micro):[/bold]    {result.arena_kb:.1f} KB"
+        f"Flash (INT8):  {result.flash_kb:.1f} KB\n"
+        f"RAM   (arena): {result.arena_kb:.1f} KB"
     )
 
-    # ── Step 4: Compatibility report ─────────────────────────────────────────
     console.print()
-    console.rule("[dim]Board Compatibility[/dim]")
+    console.rule("Board Compatibility")
 
     if mcu:
         try:
-            target = load_target(mcu)
-            compat_list = [check_compatibility(result.arena_kb, result.flash_kb, target)]
+            t = load_target(mcu)
+            compat_list = [check_compatibility(result.arena_kb, result.flash_kb, t)]
         except FileNotFoundError as e:
-            console.print(f"[red]✗[/red] {e}")
+            console.print(f"{FAIL} {e}")
             sys.exit(1)
     else:
         compat_list = check_all_targets(result.arena_kb, result.flash_kb)
 
-    table = Table(box=box.SIMPLE, show_header=True, header_style="bold dim")
-    table.add_column("Board",  style="bold")
-    table.add_column("Core",   style="dim")
-    table.add_column("RAM",    justify="right")
-    table.add_column("Flash",  justify="right")
-    table.add_column("Arena",  justify="right")
-    table.add_column("Status", justify="center")
+    table = Table(box=box.SIMPLE, header_style="bold dim")
+    table.add_column("Board");  table.add_column("Core", style="dim")
+    table.add_column("RAM",  justify="right"); table.add_column("Flash", justify="right")
+    table.add_column("Arena", justify="right"); table.add_column("Status", justify="center")
 
-    _status_icons = {
-        FitStatus.FITS:      "[green]✓  FITS[/green]",
-        FitStatus.TIGHT:     "[yellow]⚠  TIGHT[/yellow]",
-        FitStatus.TOOSMALL:  "[red]✗  TOO SMALL[/red]",
+    _icons = {
+        "fits":      "FITS",
+        "tight":     "TIGHT",
+        "too_small": "TOO SMALL",
     }
 
     for c in compat_list:
         t = c.target
         worst = (
-            FitStatus.TOOSMALL if (
-                c.ram_status == FitStatus.TOOSMALL or
-                c.flash_status == FitStatus.TOOSMALL
-            ) else (
-                FitStatus.TIGHT if (
-                    c.ram_status == FitStatus.TIGHT or
-                    c.flash_status == FitStatus.TIGHT
-                ) else FitStatus.FITS
-            )
+            "too_small" if (c.ram_status == FitStatus.TOOSMALL or c.flash_status == FitStatus.TOOSMALL)
+            else "tight" if (c.ram_status == FitStatus.TIGHT or c.flash_status == FitStatus.TIGHT)
+            else "fits"
         )
         table.add_row(
-            t.name,
-            t.core,
-            f"{t.ram_kb} KB",
-            f"{t.flash_kb} KB",
+            t.name, t.core,
+            f"{t.ram_kb} KB", f"{t.flash_kb} KB",
             f"{c.arena_kb:.0f} KB",
-            _status_icons[worst],
+            _icons[worst],
         )
         for w in c.warnings:
-            table.add_row("", "", "", "", "", f"  [dim yellow]⚠ {w}[/dim yellow]")
-
+            table.add_row("", "", "", "", "", f"  {WARN} {w}")
     console.print(table)
 
-    # ── JSON output ──────────────────────────────────────────────────────────
     if as_json:
         import json
         out = {
-            "model": str(p),
-            "format": fmt.value,
-            "size_bytes": info["size_bytes"],
-            "onnx_opset": result.onnx_opset,
-            "op_counts": result.op_counts,
+            "model": str(p), "format": fmt.value,
             "parameter_count": result.parameter_count,
-            "flash_kb": result.flash_kb,
-            "ram_kb": result.ram_kb,
-            "arena_kb": result.arena_kb,
+            "flash_kb": result.flash_kb, "arena_kb": result.arena_kb,
             "compatibility": [
-                {
-                    "target_id": c.target.id,
-                    "fits": c.fits,
-                    "ram_status": c.ram_status.value,
-                    "flash_status": c.flash_status.value,
-                    "warnings": c.warnings,
-                }
+                {"target_id": c.target.id, "fits": c.fits, "warnings": c.warnings}
                 for c in compat_list
             ],
         }
@@ -230,104 +172,180 @@ def analyze(model_path: str, mcu: str | None, as_json: bool):
 
 @main.command()
 @click.argument("model_path", type=click.Path(exists=True))
-@click.option("--mcu", required=True, help="Target MCU profile ID.")
+@click.option("--mcu",        required=True, help="Target MCU profile ID.")
 @click.option("--output", "-o", default=None, help="Output .onnx path.")
-def optimize(model_path: str, mcu: str, output: str | None):
-    """
-    Optimize a model to fit the target MCU RAM/flash budget.
-    Applies INT8 quantisation, operator fusion, and constant folding.
-    """
+@click.option(
+    "--mode", "quant_mode", default="dynamic",
+    type=click.Choice(["dynamic", "static"]),
+    help="Quantisation mode.",
+)
+@click.option("--calibration-dir", default=None,
+              help="Directory of .npy files for static quantisation.")
+def optimize(model_path: str, mcu: str, output: str | None,
+             quant_mode: str, calibration_dir: str | None):
+    """Optimise a model to fit the target MCU -- quantise, simplify, check budget."""
+    from edgeforge.optimizer.optimizer import optimize as _optimize, OptimizeError
+    from edgeforge.targets.loader      import load_target
+    from edgeforge.optimizer.budget    import format_bar
+
+    p = Path(model_path)
+    console.rule("EdgeForge Optimize")
+
+    try:
+        target = load_target(mcu)
+    except FileNotFoundError as e:
+        console.print(f"{FAIL} {e}"); sys.exit(1)
+
     console.print(
-        f"[bold]EdgeForge[/bold] optimizing [cyan]{model_path}[/cyan] "
-        f"for [cyan]{mcu}[/cyan]..."
+        f"\nModel:  {p.name}\n"
+        f"Target: {target.name}  (RAM {target.ram_kb} KB  Flash {target.flash_kb} KB)\n"
+        f"Mode:   {quant_mode} quantisation\n"
     )
-    console.print("[dim]Phase 2 — not yet implemented.[/dim]")
+
+    out_path = Path(output) if output else None
+
+    with console.status("Running optimisation pipeline..."):
+        try:
+            result = _optimize(
+                src=p, target=target, output_path=out_path,
+                mode=quant_mode,
+                calibration_dir=calibration_dir,
+                strict=False,
+            )
+        except OptimizeError as e:
+            console.print(f"{FAIL} Optimisation failed: {e}"); sys.exit(1)
+        except Exception as e:
+            console.print(f"{FAIL} Unexpected error: {e}"); sys.exit(1)
+
+    console.rule("Steps Applied")
+    for step in result.steps_applied:
+        console.print(f"  {OK} {step}")
+    sr = result.simplify_report
+    if sr.nodes_saved > 0:
+        console.print(
+            f"  Graph: {sr.nodes_before} -> {sr.nodes_after} nodes "
+            f"(-{sr.nodes_saved} removed/fused)"
+        )
+    qr = result.quantize_report
+    if qr.already_quantized:
+        console.print(
+            f"  [NOTE] Model is already INT8 quantised -- no further "
+            f"size reduction was applied."
+        )
+        console.print(
+            f"  [NOTE] Flash size reflects the quantised weights as-is. "
+            f"If it still exceeds flash budget, the model architecture "
+            f"itself is too large for this MCU. Consider a smaller variant."
+        )
+
+    console.print()
+    console.rule("Size Reduction")
+    delta = result.flash_before_kb - result.flash_after_kb
+    sign  = "-" if delta >= 0 else "+"
+    label = "saved" if delta >= 0 else "grew"
+    console.print(
+        f"  Flash  {result.flash_before_kb:>8.1f} KB  ->  "
+        f"{result.flash_after_kb:>8.1f} KB  "
+        f"({sign}{abs(result.flash_reduction_pct):.0f}% {label})"
+    )
+    if result.quantize_report.already_quantized:
+        console.print(
+            f"  [NOTE] Model is already INT8 -- no quantisation applied."
+        )
+        console.print(
+            f"  [NOTE] To fit this MCU, a smaller architecture is needed"
+            f" (e.g. DS-CNN-S for audio, MobileNetV2 0.35x for vision)."
+        )
+
+    console.print()
+    console.rule(f"Budget Check -- {target.name}")
+    br = result.budget_report
+    ram_icon   = OK   if br.ram_fits   else FAIL
+    flash_icon = OK   if br.flash_fits else FAIL
+    console.print(
+        f"  RAM    {format_bar(br.ram_used_pct)}  "
+        f"{br.arena_kb:>6.0f} / {br.target_ram_kb} KB  {ram_icon}"
+    )
+    console.print(
+        f"  Flash  {format_bar(br.flash_used_pct)}  "
+        f"{br.flash_kb:>6.0f} / {br.target_flash_kb} KB  {flash_icon}"
+    )
+    if br.suggestions:
+        console.print()
+        for tip in br.suggestions:
+            console.print(f"  {WARN}  {tip}")
+
+    console.print()
+    if result.fits:
+        console.print(f"{OK} Fits {target.id}  ->  {result.output_path}")
+    else:
+        console.print(
+            f"{WARN} Written but does not fit {target.id}  ->  {result.output_path}"
+        )
 
 
 # ── edgeforge compile ────────────────────────────────────────────────────────
 
 @main.command()
 @click.argument("model_path", type=click.Path(exists=True))
-@click.option("--mcu", required=True, help="Target MCU profile ID.")
-@click.option(
-    "--rtos", default="none",
-    type=click.Choice(["none", "freertos", "zephyr"]),
-    help="RTOS for generated glue code.",
-)
-@click.option("--output-dir", "-o", default="edgeforge_output", help="Output directory.")
+@click.option("--mcu", required=True)
+@click.option("--rtos", default="none",
+              type=click.Choice(["none", "freertos", "zephyr"]))
+@click.option("--output-dir", "-o", default="edgeforge_output")
 def compile(model_path: str, mcu: str, rtos: str, output_dir: str):
-    """
-    Compile a model to C/C++ files ready to drop into your firmware project.
-    """
+    """Compile a model to C/C++ files for your firmware project."""
     console.print(
-        f"[bold]EdgeForge[/bold] compiling [cyan]{model_path}[/cyan] "
-        f"for [cyan]{mcu}[/cyan] (rtos=[cyan]{rtos}[/cyan])..."
+        f"EdgeForge compiling {model_path} "
+        f"for {mcu} (rtos={rtos})..."
     )
-    console.print("[dim]Phase 3 — not yet implemented.[/dim]")
+    console.print("Phase 3 -- not yet implemented.")
 
 
 # ── edgeforge targets ────────────────────────────────────────────────────────
 
 @main.command("targets")
-@click.option("--mcu", default=None, help="Show details for a specific target.")
+@click.option("--mcu", default=None)
 def list_targets(mcu: str | None):
     """List all supported MCU targets."""
-    from .targets.loader import load_target, all_targets
+    from edgeforge.targets.loader import load_target, all_targets
 
     if mcu:
         try:
             t = load_target(mcu)
-            _print_target_detail(t)
         except FileNotFoundError as e:
-            console.print(f"[red]✗[/red] {e}")
-            sys.exit(1)
+            console.print(f"{FAIL} {e}"); sys.exit(1)
+        console.print()
+        console.rule(t.name)
+        console.print(f"  ID: {t.id}  Vendor: {t.vendor}")
+        console.print(f"  Core: {t.core}  FPU: {t.fpu}  NPU: {t.npu}")
+        console.print(f"  RAM: {t.ram_kb} KB  Flash: {t.flash_kb} KB")
+        console.print(f"  CMSIS-NN: {t.cmsis_nn}  Runtime: {t.runtime}")
+        rtos = ", ".join(
+            r for r, ok in [("FreeRTOS", t.rtos_freertos), ("Zephyr", t.rtos_zephyr)] if ok
+        ) or "--"
+        console.print(f"  RTOS: {rtos}")
+        console.print(f"  Flags: {t.compiler_flags}")
         return
 
     table = Table(box=box.SIMPLE, header_style="bold dim")
-    table.add_column("ID",      style="cyan bold")
-    table.add_column("Name")
-    table.add_column("Core",    style="dim")
-    table.add_column("RAM",     justify="right")
-    table.add_column("Flash",   justify="right")
-    table.add_column("NPU",     justify="center")
-    table.add_column("RTOS",    style="dim")
+    table.add_column("ID", style="bold"); table.add_column("Name")
+    table.add_column("Core", style="dim")
+    table.add_column("RAM",  justify="right"); table.add_column("Flash", justify="right")
+    table.add_column("NPU",  justify="center"); table.add_column("RTOS", style="dim")
 
     for t in all_targets():
-        rtos_parts = []
-        if t.rtos_freertos: rtos_parts.append("FreeRTOS")
-        if t.rtos_zephyr:   rtos_parts.append("Zephyr")
+        rtos = ", ".join(
+            r for r, ok in [("FreeRTOS", t.rtos_freertos), ("Zephyr", t.rtos_zephyr)] if ok
+        ) or "--"
         table.add_row(
-            t.id,
-            t.name,
-            t.core,
-            f"{t.ram_kb} KB",
-            f"{t.flash_kb} KB",
-            "[green]✓[/green]" if t.npu else "[dim]—[/dim]",
-            ", ".join(rtos_parts) or "—",
+            t.id, t.name, t.core,
+            f"{t.ram_kb} KB", f"{t.flash_kb} KB",
+            "YES" if t.npu else "--",
+            rtos,
         )
-
     console.print()
-    console.rule("[bold]EdgeForge Supported Targets[/bold]")
+    console.rule("EdgeForge Supported Targets")
     console.print(table)
-
-
-def _print_target_detail(t) -> None:
-    console.print()
-    console.rule(f"[bold]{t.name}[/bold]")
-    console.print(f"  ID:      [cyan]{t.id}[/cyan]")
-    console.print(f"  Vendor:  {t.vendor}")
-    console.print(f"  Core:    {t.core}")
-    console.print(f"  FPU:     {'yes' if t.fpu else 'no'}")
-    console.print(f"  NPU:     {'yes' if t.npu else 'no'}")
-    console.print(f"  RAM:     {t.ram_kb} KB")
-    console.print(f"  Flash:   {t.flash_kb} KB")
-    console.print(f"  Runtime: {t.runtime}")
-    console.print(f"  CMSIS-NN: {'yes' if t.cmsis_nn else 'no'}")
-    rtos = []
-    if t.rtos_freertos: rtos.append("FreeRTOS")
-    if t.rtos_zephyr:   rtos.append("Zephyr")
-    console.print(f"  RTOS:    {', '.join(rtos) or '—'}")
-    console.print(f"  Flags:   [dim]{t.compiler_flags}[/dim]")
 
 
 if __name__ == "__main__":
