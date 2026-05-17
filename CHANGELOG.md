@@ -1,23 +1,25 @@
 # Changelog (internal)
 
-## [0.2.0-alpha] — Phase 2 complete
+## [0.3.0-alpha] — Phase 3 complete
+- codegen/model_extractor.py   — weight + tensor metadata extraction
+- codegen/arena_planner.py     — TFLite Micro arena sizing + CCM detection
+- codegen/codegen.py           — Jinja2 orchestrator
+- templates/model_h.jinja2     — model.h with tensor defines + weight externs
+- templates/model_c.jinja2     — model.c with hex weight arrays
+- templates/memory_config_h.jinja2 — arena size + alignment + sanity checks
+- templates/inference_runner_h.jinja2 — public C API
+- templates/inference_runner_c.jinja2 — TFLite Micro wrapper
+- templates/rtos_glue_c.jinja2 — FreeRTOS/Zephyr task-safe inference
+- templates/CMakeLists.jinja2  — CMake build fragment
+- templates/README.jinja2      — per-board integration guide
+- edgeforge compile CLI command — fully implemented
+- 26 new tests (52 total)
 
-### Added
-- optimizer/simplifier.py — constant folding, dead node removal, Conv+BN fusion
-- optimizer/quantizer.py  — INT8 dynamic and static quantisation (onnxruntime)
-- optimizer/budget.py     — MCU RAM/flash budget checker and suggestion engine
-- optimizer/optimizer.py  — full pipeline orchestrator (simplify → quantise → check)
-- edgeforge optimize CLI command — rich output with before/after stats and progress bars
-- 26 new tests across test_simplifier, test_quantizer, test_budget, test_optimizer
+## [0.2.0-alpha] — Phase 2 complete
+- optimizer/simplifier.py, quantizer.py, budget.py, optimizer.py
+- 26 tests
 
 ## [0.1.0-alpha] — Phase 1 complete
-
-### Added
-- converter/detector.py — magic byte + extension format detection
-- converter/to_onnx.py  — unified ONNX IR conversion (TFLite, PyTorch, TF)
-- converter/analyzer.py — graph ops, RAM/flash estimates
-- targets/loader.py     — MCU YAML profile loader + compatibility checker
-- MCU profiles: stm32f407, psoc6, nrf52840
-- edgeforge analyze CLI command
-- edgeforge targets CLI command
-- 17 tests
+- converter/detector.py, to_onnx.py, analyzer.py
+- targets/loader.py + 3 MCU profiles
+- 17 tests (+ 2 warnings — protobuf Python 3.14 deprecation, harmless)

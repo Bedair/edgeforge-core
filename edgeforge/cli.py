@@ -288,17 +288,58 @@ def optimize(model_path: str, mcu: str, output: str | None,
 
 @main.command()
 @click.argument("model_path", type=click.Path(exists=True))
-@click.option("--mcu", required=True)
+@click.option("--mcu", required=True, help="Target MCU profile ID.")
 @click.option("--rtos", default="none",
-              type=click.Choice(["none", "freertos", "zephyr"]))
-@click.option("--output-dir", "-o", default="edgeforge_output")
+              type=click.Choice(["none", "freertos", "zephyr"]),
+              help="RTOS for generated glue code.")
+@click.option("--output-dir", "-o", default="edgeforge_output",
+              help="Output directory for generated files.")
 def compile(model_path: str, mcu: str, rtos: str, output_dir: str):
-    """Compile a model to C/C++ files for your firmware project."""
-    console.print(
-        f"EdgeForge compiling {model_path} "
-        f"for {mcu} (rtos={rtos})..."
-    )
-    console.print("Phase 3 -- not yet implemented.")
+    """Compile a model to C/C++ files ready for your firmware project."""
+    from edgeforge.targets.loader import load_target
+    from edgeforge.codegen.codegen import generate, CodegenError
+
+    p = Path(model_path)
+    console.rule("EdgeForge Compile")
+
+    try:
+        target = load_target(mcu)
+    except FileNotFoundError as e:
+        console.print(f"{FAIL} {e}"); sys.exit(1)
+
+    console.print(f"Model:  {p.name}")
+    console.print(f"Target: {target.name}")
+    console.print(f"RTOS:   {rtos}")
+    console.print(f"Output: {output_dir}")
+
+    with console.status("Generating C/C++ files..."):
+        try:
+            result = generate(
+                model_path=p,
+                target=target,
+                rtos=rtos,
+                output_dir=output_dir,
+            )
+        except (CodegenError, FileNotFoundError) as e:
+            console.print(f"{FAIL} Code generation failed: {e}"); sys.exit(1)
+        except Exception as e:
+            console.print(f"{FAIL} Unexpected error: {e}"); sys.exit(1)
+
+    console.rule("Generated Files")
+    for f in result.files_written:
+        console.print(f"  {OK} {f}")
+
+    console.print()
+    mi = result.model_info
+    ar = result.arena_config
+    console.print(f"Model:  {mi.node_count} nodes  {mi.op_summary[:60]}")
+    console.print(f"Arena:  {ar.total_bytes_aligned} bytes ({ar.total_kb:.1f} KB)")
+    console.print(f"RAM left after arena:  {ar.ram_headroom_kb:.1f} KB")
+    if ar.ccm_eligible and ar.fits_in_ccm:
+        console.print(f"[NOTE] Arena fits in CCM SRAM -- set EDGEFORGE_USE_CCM=1 for better performance")
+
+    console.print()
+    console.print(f"{OK} Output written to: {result.output_dir}")
 
 
 # ── edgeforge targets ────────────────────────────────────────────────────────
