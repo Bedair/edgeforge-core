@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "edgeforge"
-version = "0.3.0-alpha"
+version = "0.4.0-alpha"
 description = "Toolchain for deploying AI models to embedded devices"
 readme = "README.md"
 license = { text = "Proprietary" }

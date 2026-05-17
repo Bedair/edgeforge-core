@@ -391,3 +391,156 @@ def list_targets(mcu: str | None):
 
 if __name__ == "__main__":
     main()
+
+
+# ── edgeforge benchmark ──────────────────────────────────────────────────────
+
+@main.command()
+@click.argument("output_dir", type=click.Path(exists=True))
+@click.option("--mcu", required=True, help="Target MCU profile ID.")
+@click.option("--compiler", default="arm-none-eabi-gcc",
+              help="Cross-compiler to use for compile check.")
+def benchmark(output_dir: str, mcu: str, compiler: str):
+    """Validate generated files compile for the target MCU and report size estimates."""
+    import subprocess
+    import shutil
+    from edgeforge.targets.loader import load_target
+
+    out = Path(output_dir)
+    console.rule("EdgeForge Benchmark")
+
+    try:
+        target = load_target(mcu)
+    except FileNotFoundError as e:
+        console.print(f"{FAIL} {e}"); sys.exit(1)
+
+    console.print(f"\nOutput dir: {out}")
+    console.print(f"Target:     {target.name}")
+    console.print(f"Compiler:   {compiler}\n")
+
+    # ── Check required files exist ────────────────────────────────────────────
+    required = ["model.h", "model.c", "memory_config.h",
+                "inference_runner.h", "inference_runner.c"]
+    console.rule("File check")
+    all_present = True
+    for fname in required:
+        fpath = out / fname
+        if fpath.exists():
+            size_kb = fpath.stat().st_size / 1024
+            console.print(f"  {OK} {fname:<30} ({size_kb:.1f} KB)")
+        else:
+            console.print(f"  {FAIL} {fname} -- MISSING")
+            all_present = False
+
+    if not all_present:
+        console.print(f"\n{FAIL} Missing files -- re-run edgeforge compile")
+        sys.exit(1)
+
+    # ── Compiler check ────────────────────────────────────────────────────────
+    console.print()
+    console.rule("Compile check")
+
+    gcc_available = shutil.which(compiler) is not None
+
+    if not gcc_available:
+        console.print(
+            f"  {WARN} {compiler} not found -- skipping compile check.\n"
+            f"  Install from: https://developer.arm.com/Tools%20and%20Software/GNU%20Toolchain\n"
+            f"  On Windows: winget install Arm.GnuArmEmbeddedToolchain"
+        )
+    else:
+        # Compile model.c and inference_runner.c (syntax + type check only, no link)
+        flags = target.compiler_flags.split() + [
+            "-mthumb", "-std=c11", "-Os", "-Wall", "-Wextra",
+            "-DEDGEFORGE_COMPILE_CHECK",
+            f"-I{out}",
+            "-c",
+        ]
+
+        files_to_check = [
+            str(out / "model.c"),
+            str(out / "inference_runner.c"),
+        ]
+        if (out / "rtos_glue.c").exists():
+            files_to_check.append(str(out / "rtos_glue.c"))
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            all_ok = True
+            for src in files_to_check:
+                fname = Path(src).name
+                obj   = str(Path(tmp) / (fname + ".o"))
+                cmd   = [compiler] + flags + [src, "-o", obj]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    console.print(f"  {OK} {fname}")
+                else:
+                    console.print(f"  {FAIL} {fname}")
+                    for line in result.stderr.strip().splitlines():
+                        console.print(f"      {line}")
+                    all_ok = False
+
+            if all_ok:
+                console.print(f"\n  {OK} All files compiled without errors")
+            else:
+                console.print(f"\n  {FAIL} Compile errors found -- check output above")
+                sys.exit(1)
+
+    # ── Static analysis -- read memory config defines ─────────────────────────
+    console.print()
+    console.rule("Memory report")
+
+    mem_config = (out / "memory_config.h").read_text(encoding="utf-8")
+
+    def extract_define(content: str, name: str) -> str:
+        import re
+        m = re.search(rf"#define\s+{name}\s+(\S+)", content)
+        return m.group(1).rstrip("U") if m else "?"
+
+    arena_bytes = extract_define(mem_config, "EDGEFORGE_ARENA_SIZE")
+    alignment   = extract_define(mem_config, "EDGEFORGE_ARENA_ALIGNMENT")
+    ram_kb      = extract_define(mem_config, "EDGEFORGE_TARGET_RAM_KB")
+    flash_kb    = extract_define(mem_config, "EDGEFORGE_TARGET_FLASH_KB")
+    cmsis_nn    = extract_define(mem_config, "EDGEFORGE_CMSIS_NN")
+
+    model_h = (out / "model.h").read_text(encoding="utf-8")
+    weight_bytes = extract_define(model_h, "EDGEFORGE_WEIGHT_BYTES")
+    input_size   = extract_define(model_h, "EDGEFORGE_INPUT_SIZE")
+    output_size  = extract_define(model_h, "EDGEFORGE_OUTPUT_SIZE")
+    is_quant     = extract_define(model_h, "EDGEFORGE_IS_QUANTIZED")
+
+    try:
+        arena_kb_f  = int(arena_bytes) / 1024
+        weight_kb_f = int(weight_bytes) / 1024
+        ram_used    = int(arena_bytes) / (int(ram_kb) * 1024) * 100
+        flash_used  = int(weight_bytes) / (int(flash_kb) * 1024) * 100
+    except (ValueError, ZeroDivisionError):
+        arena_kb_f = weight_kb_f = ram_used = flash_used = 0.0
+
+    console.print(f"  Arena size:     {arena_bytes} bytes ({arena_kb_f:.1f} KB)")
+    console.print(f"  Arena align:    {alignment} bytes")
+    console.print(f"  Weight storage: {weight_bytes} bytes ({weight_kb_f:.1f} KB)")
+    console.print(f"  Input buffer:   {input_size} bytes")
+    console.print(f"  Output buffer:  {output_size} bytes")
+    console.print(f"  Quantised:      {'yes' if is_quant == '1' else 'no'}")
+    console.print(f"  CMSIS-NN:       {'yes' if cmsis_nn == '1' else 'no'}")
+    console.print()
+    console.print(f"  RAM  used: {ram_used:.1f}% of {ram_kb} KB")
+    console.print(f"  Flash used: {flash_used:.1f}% of {flash_kb} KB")
+    console.print()
+
+    if ram_used < 80 and flash_used < 60:
+        console.print(f"{OK} Model fits {target.id} with comfortable headroom")
+    elif ram_used < 100 and flash_used < 100:
+        console.print(f"{WARN} Model fits {target.id} but headroom is tight")
+    else:
+        console.print(f"{FAIL} Model does not fit {target.id} -- re-run edgeforge optimize")
+        sys.exit(1)
+
+    # ── Next steps ────────────────────────────────────────────────────────────
+    console.print()
+    console.rule("Next steps")
+    console.print(f"  1. Copy edgeforge_output/ into your {target.name} firmware project")
+    console.print(f"  2. Add TFLite Micro as a dependency")
+    console.print(f"  3. Include validation/main.c for a ready-made test harness")
+    console.print(f"  4. Flash and check UART output")

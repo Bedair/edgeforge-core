@@ -49,6 +49,16 @@
 #define EDGEFORGE_TARGET_CORE       "{{ target.core }}"
 #define EDGEFORGE_CMSIS_NN          {{ 1 if target.cmsis_nn else 0 }}
 
+/* -- CMSIS-NN scratch buffer ------------------------------------------------ */
+
+/**
+ * EDGEFORGE_SCRATCH_SIZE
+ * Scratch buffer for CMSIS-NN intermediate calculations (e.g. im2col).
+ * Allocated statically inside inference_runner.c -- not the developer's concern.
+ * Size = 2 * max(kH * kW * in_channels) * sizeof(int16_t) across all Conv layers.
+ */
+#define EDGEFORGE_SCRATCH_SIZE      {{ arena.scratch_bytes if arena.scratch_bytes is defined else 2048 }}U
+
 /* -- Sanity checks --------------------------------------------------------- */
 #if EDGEFORGE_ARENA_SIZE > (EDGEFORGE_TARGET_RAM_KB * 1024U)
 #  error "Arena size exceeds target RAM. Re-run edgeforge optimize."

@@ -47,6 +47,7 @@ class ArenaConfig:
     # Headroom
     ram_headroom_bytes: int
     ram_headroom_kb:    float
+    scratch_bytes:      int = 2048  # CMSIS-NN scratch buffer
 
     @property
     def total_bytes_aligned(self) -> int:
