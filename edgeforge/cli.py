@@ -288,14 +288,34 @@ def optimize(model_path: str, mcu: str, output: str | None,
 
 @main.command()
 @click.argument("model_path", type=click.Path(exists=True))
-@click.option("--mcu", required=True, help="Target MCU profile ID.")
+@click.option("--mcu", required=True, help="Target MCU profile ID (e.g. nrf52840, psoc6, stm32f407).")
 @click.option("--rtos", default="none",
               type=click.Choice(["none", "freertos", "zephyr"]),
-              help="RTOS for generated glue code.")
+              help="RTOS for generated glue code (default: none).")
+@click.option(
+    "--target", "build_target", default="cmake",
+    type=click.Choice(["cmake", "arduino"]),
+    help=(
+        "Output format.\n"
+        "cmake   = C/C++ source files for any CMake/Makefile project (default).\n"
+        "arduino = model_data.h byte array for Arduino IDE + starter .ino sketch."
+    )
+)
 @click.option("--output-dir", "-o", default="edgeforge_output",
-              help="Output directory for generated files.")
-def compile(model_path: str, mcu: str, rtos: str, output_dir: str):
-    """Compile a model to C/C++ files ready for your firmware project."""
+              help="Output directory for generated files (cmake) or sketch folder (arduino).")
+def compile(model_path: str, mcu: str, rtos: str,
+            build_target: str, output_dir: str):
+    """Compile a model to firmware-ready code for your target.
+
+    \b
+    For a CMake/Makefile firmware project:
+      edgeforge compile models/gesture_model_opt.onnx --mcu=nrf52840 --rtos=freertos
+
+    \b
+    For Arduino IDE:
+      edgeforge compile models/gesture_model_opt.onnx --mcu=nrf52840 --target=arduino
+      edgeforge compile models/gesture_model_opt.onnx --mcu=nrf52840 --target=arduino -o MySketch/
+    """
     from edgeforge.targets.loader import load_target
     from edgeforge.codegen.codegen import generate, CodegenError
 
@@ -310,8 +330,15 @@ def compile(model_path: str, mcu: str, rtos: str, output_dir: str):
     console.print(f"Model:  {p.name}")
     console.print(f"Target: {target.name}")
     console.print(f"RTOS:   {rtos}")
+    console.print(f"Mode:   {build_target}")
     console.print(f"Output: {output_dir}")
 
+    # ── Arduino target ────────────────────────────────────────────────────────
+    if build_target == "arduino":
+        _compile_arduino(p, target, output_dir)
+        return
+
+    # ── CMake target (default) ────────────────────────────────────────────────
     with console.status("Generating C/C++ files..."):
         try:
             result = generate(
@@ -336,10 +363,450 @@ def compile(model_path: str, mcu: str, rtos: str, output_dir: str):
     console.print(f"Arena:  {ar.total_bytes_aligned} bytes ({ar.total_kb:.1f} KB)")
     console.print(f"RAM left after arena:  {ar.ram_headroom_kb:.1f} KB")
     if ar.ccm_eligible and ar.fits_in_ccm:
-        console.print(f"[NOTE] Arena fits in CCM SRAM -- set EDGEFORGE_USE_CCM=1 for better performance")
-
+        console.print(
+            f"[NOTE] Arena fits in CCM SRAM -- set EDGEFORGE_USE_CCM=1 for better performance"
+        )
     console.print()
     console.print(f"{OK} Output written to: {result.output_dir}")
+
+
+def _onnx_to_tflite(p: Path) -> bytes | None:
+    """
+    Convert an ONNX model to TFLite flatbuffer bytes using onnx2tf.
+    Returns the float32 .tflite bytes, or None on failure.
+    """
+    import os, tempfile
+
+    try:
+        import onnx2tf
+    except ImportError:
+        console.print(
+            f"\n{FAIL} onnx2tf not installed.\n"
+            f"  Fix: pip install onnx2tf\n"
+            f"  Then retry the compile command."
+        )
+        return None
+
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="edgeforge_tflite_") as tmp:
+            onnx2tf.convert(
+                input_onnx_file_path=str(p),
+                output_folder_path=tmp,
+                non_verbose=True,
+            )
+            tmp_path = Path(tmp)
+
+            # Prefer float32 over float16
+            float32 = [f for f in tmp_path.glob("*.tflite") if "float16" not in f.name]
+            any_tflite = list(tmp_path.glob("*.tflite"))
+
+            candidates = float32 or any_tflite
+            if not candidates:
+                console.print(f"\n{FAIL} onnx2tf ran but produced no .tflite file")
+                return None
+
+            data = candidates[0].read_bytes()
+
+            # Verify the TFLite is valid by checking the magic bytes
+            if len(data) < 8:
+                console.print(f"\n{FAIL} Generated TFLite file is too small ({len(data)} bytes)")
+                return None
+
+            console.print(f"\n{OK} Converted to TFLite ({len(data):,} bytes)")
+            return data
+
+    except Exception as e:
+        console.print(f"\n{FAIL} onnx2tf conversion failed: {e}")
+        return None
+
+
+# TFLite builtin op code -> (name, resolver method)
+_TFLITE_OPS: dict[int, tuple[str, str]] = {
+    0:   ("ADD",                  "AddAdd"),
+    1:   ("AVERAGE_POOL_2D",      "AddAveragePool2D"),
+    2:   ("CONCATENATION",        "AddConcatenation"),
+    3:   ("CONV_2D",              "AddConv2D"),
+    4:   ("DEPTHWISE_CONV_2D",    "AddDepthwiseConv2D"),
+    6:   ("DEQUANTIZE",           "AddDequantize"),
+    9:   ("FULLY_CONNECTED",      "AddFullyConnected"),
+    14:  ("LOGISTIC",             "AddLogistic"),
+    17:  ("MAX_POOL_2D",          "AddMaxPool2D"),
+    18:  ("MUL",                  "AddMul"),
+    19:  ("RELU",                 "AddRelu"),
+    21:  ("RELU6",                "AddRelu6"),
+    22:  ("RESHAPE",              "AddReshape"),
+    25:  ("SOFTMAX",              "AddSoftmax"),
+    27:  ("SVDF",                 "AddSvdf"),
+    28:  ("TANH",                 "AddTanh"),
+    34:  ("PAD",                  "AddPad"),
+    36:  ("GATHER",               "AddGather"),
+    39:  ("TRANSPOSE",            "AddTranspose"),
+    40:  ("MEAN",                 "AddMean"),
+    41:  ("SUB",                  "AddSub"),
+    42:  ("DIV",                  "AddDiv"),
+    43:  ("SQUEEZE",              "AddSqueeze"),
+    45:  ("STRIDED_SLICE",        "AddStridedSlice"),
+    47:  ("EXP",                  "AddExp"),
+    49:  ("SPLIT",                "AddSplit"),
+    53:  ("CAST",                 "AddCast"),
+    60:  ("PADV2",                "AddPadV2"),
+    65:  ("SLICE",                "AddSlice"),
+    69:  ("TILE",                 "AddTile"),
+    70:  ("EXPAND_DIMS",          "AddExpandDims"),
+    74:  ("SUM",                  "AddSum"),
+    75:  ("SQRT",                 "AddSqrt"),
+    83:  ("PACK",                 "AddPack"),
+    88:  ("UNPACK",               "AddUnpack"),
+    114: ("QUANTIZE",             "AddQuantize"),
+    126: ("BATCH_MATMUL",         "AddBatchMatMul"),
+}
+
+
+def _parse_tflite_ops(tflite_bytes: bytes) -> list[tuple[int, str, str]]:
+    """
+    Parse a TFLite flatbuffer and return the exact list of ops used.
+    Returns list of (builtin_code, op_name, resolver_method).
+
+    Uses onnx2tf's schema_generated.py if available (most accurate),
+    falls back to flatbuffers-based parsing.
+    """
+    import tempfile, sys
+
+    # Try onnx2tf schema parser first (most reliable)
+    try:
+        import onnx2tf, os, importlib.util
+
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+        with tempfile.TemporaryDirectory(prefix="edgeforge_schema_") as tmp:
+            # Run a dummy convert to get schema_generated.py
+            # OR find it from onnx2tf package
+            import onnx2tf as o2t
+            schema_path = Path(o2t.__file__).parent / "utils" / "schema_generated.py"
+            if not schema_path.exists():
+                # Try to generate it by converting a dummy model
+                raise FileNotFoundError("schema_generated.py not found in onnx2tf")
+
+            spec = importlib.util.spec_from_file_location("schema_generated", schema_path)
+            schema = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(schema)
+
+            buf = bytearray(tflite_bytes)
+            model = schema.ModelT.InitFromPackedBuf(buf, 0)
+
+            seen = set()
+            ops_used = []
+            for subgraph in model.subgraphs:
+                for op in subgraph.operators:
+                    oc = model.operatorCodes[op.opcodeIndex]
+                    code = oc.builtinCode if oc.builtinCode > 127 else oc.deprecatedBuiltinCode
+                    if code not in seen:
+                        seen.add(code)
+                        name, method = _TFLITE_OPS.get(code, (f"UNKNOWN_{code}", None))
+                        ops_used.append((code, name, method))
+
+            return ops_used
+
+    except Exception:
+        pass
+
+    # Fallback: use flatbuffers to parse the operator_codes vector
+    try:
+        import struct
+
+        root_off = struct.unpack_from('<I', tflite_bytes, 0)[0]
+        # Walk vtable to find operator_codes (field index 2 -> vtable slot 4)
+        vt_off = root_off - struct.unpack_from('<i', tflite_bytes, root_off)[0]
+        vt_size = struct.unpack_from('<H', tflite_bytes, vt_off)[0]
+
+        ops_used = []
+        if vt_size >= 8:
+            f2 = struct.unpack_from('<H', tflite_bytes, vt_off + 4)[0]
+            if f2 > 0:
+                vec_off = root_off + f2
+                vec_ref = struct.unpack_from('<i', tflite_bytes, vec_off)[0]
+                vec_abs = vec_off + vec_ref
+                count   = struct.unpack_from('<I', tflite_bytes, vec_abs)[0]
+
+                if 0 < count < 200:  # sanity check
+                    seen = set()
+                    for i in range(count):
+                        item_off = vec_abs + 4 + i * 4
+                        item_ref = struct.unpack_from('<i', tflite_bytes, item_off)[0]
+                        item_abs = item_off + item_ref
+                        oc_vt_off  = item_abs - struct.unpack_from('<i', tflite_bytes, item_abs)[0]
+                        oc_vt_size = struct.unpack_from('<H', tflite_bytes, oc_vt_off)[0]
+
+                        code = None
+                        # Field 1 = deprecated_builtin_code (int8)
+                        if oc_vt_size >= 6:
+                            f1 = struct.unpack_from('<H', tflite_bytes, oc_vt_off + 4)[0]
+                            if f1 > 0:
+                                code = tflite_bytes[item_abs + f1]
+                        # Field 4 = builtin_code (int32, overrides if > 127)
+                        if oc_vt_size >= 12:
+                            f4 = struct.unpack_from('<H', tflite_bytes, oc_vt_off + 10)[0]
+                            if f4 > 0:
+                                val = struct.unpack_from('<i', tflite_bytes, item_abs + f4)[0]
+                                if val > 127:
+                                    code = val
+
+                        if code is not None and code not in seen:
+                            seen.add(code)
+                            name, method = _TFLITE_OPS.get(code, (f"UNKNOWN_{code}", None))
+                            ops_used.append((code, name, method))
+
+        return ops_used
+
+    except Exception:
+        return []
+
+
+def _compile_arduino(p: Path, target, output_dir: str) -> None:
+    """
+    Generate Arduino IDE output:
+      - model_data.h  : TFLite flatbuffer as C byte array
+      - <name>.ino    : Arduino sketch with correct resolver for this specific model
+    """
+    import shutil
+
+    sketch_name = p.stem
+    out = Path(output_dir) / sketch_name
+    out.mkdir(parents=True, exist_ok=True)
+
+    console.print()
+
+    # ── Step 1: Get TFLite bytes ──────────────────────────────────────────────
+    if p.suffix.lower() == ".tflite":
+        tflite_bytes = p.read_bytes()
+        console.print(f"{OK} TFLite model read ({len(tflite_bytes):,} bytes)")
+    else:
+        with console.status("Converting ONNX -> TFLite..."):
+            tflite_bytes = _onnx_to_tflite(p)
+        if tflite_bytes is None:
+            sys.exit(1)
+
+    # ── Step 2: Parse exact ops from the TFLite flatbuffer ───────────────────
+    with console.status("Parsing TFLite ops..."):
+        ops = _parse_tflite_ops(tflite_bytes)
+
+    if ops:
+        known   = [(c, n, m) for c, n, m in ops if m is not None]
+        unknown = [(c, n, m) for c, n, m in ops if m is None]
+        console.print(f"{OK} Detected {len(ops)} ops: {', '.join(n for _, n, _ in ops)}")
+        if unknown:
+            console.print(f"{WARN} Unknown ops (no resolver method): {[n for _,n,_ in unknown]}")
+    else:
+        console.print(f"{WARN} Could not parse ops -- using safe default set")
+        # Safe default covering most float32 DS-CNN style models
+        known = [
+            (3,  "CONV_2D",           "AddConv2D"),
+            (4,  "DEPTHWISE_CONV_2D", "AddDepthwiseConv2D"),
+            (9,  "FULLY_CONNECTED",   "AddFullyConnected"),
+            (19, "RELU",              "AddRelu"),
+            (22, "RESHAPE",           "AddReshape"),
+            (25, "SOFTMAX",           "AddSoftmax"),
+            (34, "PAD",               "AddPad"),
+            (40, "MEAN",              "AddMean"),
+        ]
+
+    # ── Step 3: Write model_data.h ────────────────────────────────────────────
+    op_names_comment = ", ".join(n for _, n, _ in known)
+    header_lines = [
+        "// EdgeForge Generated File -- DO NOT EDIT",
+        f"// Model:   {p.stem}",
+        f"// Target:  {target.name}",
+        f"// Size:    {len(tflite_bytes):,} bytes",
+        f"// Ops:     {op_names_comment}",
+        f"// Command: edgeforge compile {p.name} --mcu={target.id} --target=arduino",
+        "",
+        "#pragma once",
+        "#include <stdint.h>",
+        "",
+        f"const unsigned int model_data_len = {len(tflite_bytes)}U;",
+        "",
+        "alignas(8) const uint8_t model_data[] = {",
+    ]
+    cols = 12
+    for i in range(0, len(tflite_bytes), cols):
+        chunk   = tflite_bytes[i:i+cols]
+        hex_str = ", ".join(f"0x{b:02x}" for b in chunk)
+        comma   = "," if i + cols < len(tflite_bytes) else ""
+        header_lines.append(f"    {hex_str}{comma}")
+    header_lines += ["};", ""]
+    (out / "model_data.h").write_text("\n".join(header_lines), encoding="utf-8")
+    console.print(f"{OK} model_data.h written")
+
+    # ── Step 4: Generate .ino with correct resolver block ─────────────────────
+    n_ops        = len(known)
+    resolver_decl = f"static tflite::MicroMutableOpResolver<{n_ops}> resolver;"
+    resolver_adds = "\n    ".join(f"resolver.{m}();" for _, _, m in known)
+    arena_kb      = max(target.ram_kb // 8, 32)  # 1/8 of RAM, min 32 KB
+
+    # Check if the model uses IMU input (shape [1,1,50,3] style)
+    uses_imu = "gesture" in p.stem.lower() or "imu" in p.stem.lower()
+
+    if uses_imu:
+        sensor_includes = "#include <Arduino_LSM9DS1.h>\n"
+        sensor_init = """\
+    if (!IMU.begin()) {
+        Serial.println("[FAIL] LSM9DS1 init failed");
+        while (1);
+    }
+    Serial.print("[OK]  LSM9DS1 ready (");
+    Serial.print(IMU.accelerationSampleRate());
+    Serial.println(" Hz)");"""
+        sensor_loop = """\
+    float ax, ay, az;
+    if (IMU.accelerationAvailable()) {
+        IMU.readAcceleration(ax, ay, az);
+        g_window[g_window_idx][0] = ax;
+        g_window[g_window_idx][1] = ay;
+        g_window[g_window_idx][2] = az;
+        g_window_idx = (g_window_idx + 1) % WINDOW_SAMPLES;
+        if (g_window_idx == 0) g_window_full = true;
+    }
+    if (g_window_full && g_window_idx == 0) {
+        run_inference();
+    }"""
+        sensor_globals = """\
+#define SAMPLE_RATE_HZ   50
+#define WINDOW_SAMPLES   50
+#define N_AXES           3
+static float         g_window[WINDOW_SAMPLES][N_AXES];
+static int           g_window_idx  = 0;
+static bool          g_window_full = false;
+static unsigned long g_last_sample_ms = 0;"""
+        infer_fill = """\
+    float *inp = input_tensor->data.f;
+    for (int i = 0; i < WINDOW_SAMPLES; i++) {
+        int idx = (g_window_idx + i) % WINDOW_SAMPLES;
+        inp[i * N_AXES + 0] = g_window[idx][0];
+        inp[i * N_AXES + 1] = g_window[idx][1];
+        inp[i * N_AXES + 2] = g_window[idx][2];
+    }"""
+        loop_body = f"""\
+    unsigned long now = millis();
+    if ((now - g_last_sample_ms) < (1000 / SAMPLE_RATE_HZ)) return;
+    g_last_sample_ms = now;
+    {sensor_loop}"""
+    else:
+        sensor_includes = ""
+        sensor_init = "    // Fill input_tensor->data.f with your sensor data before calling run_inference()"
+        sensor_globals = ""
+        infer_fill = "    // TODO: fill input_tensor->data.f with your input data"
+        loop_body = "    run_inference();  // TODO: replace with your sensor read + inference trigger"
+
+    ino_content = f"""\
+/*
+ * EdgeForge Generated Sketch
+ * Model:  {p.stem}
+ * Target: {target.name}
+ * Ops:    {op_names_comment}
+ *
+ * Libraries:
+ *   1. git clone https://github.com/tensorflow/tflite-micro-arduino-examples
+ *         into: C:\\Users\\YOUR_NAME\\Documents\\Arduino\\libraries\\Arduino_TensorFlowLite
+ *   2. Tools -> Manage Libraries -> Arduino_LSM9DS1 -> Install  (if using IMU)
+ *
+ * Serial: 115200 baud
+ */
+
+{sensor_includes}#include <TensorFlowLite.h>
+#include <tensorflow/lite/micro/micro_interpreter.h>
+#include <tensorflow/lite/micro/micro_mutable_op_resolver.h>
+#include <tensorflow/lite/schema/schema_generated.h>
+#include "model_data.h"
+
+#define N_CLASSES        3
+#define ARENA_SIZE       ({arena_kb} * 1024)
+{sensor_globals}
+
+const char *CLASS_NAMES[] = {{ "idle", "shake", "tap" }};
+
+// Resolver with exactly the ops this model uses -- auto-generated by EdgeForge
+{resolver_decl}
+static uint8_t              tensor_arena[ARENA_SIZE];
+static const tflite::Model *tfl_model    = nullptr;
+static tflite::MicroInterpreter *interpreter  = nullptr;
+static TfLiteTensor         *input_tensor  = nullptr;
+static TfLiteTensor         *output_tensor = nullptr;
+
+void setup() {{
+    Serial.begin(115200);
+    while (!Serial && millis() < 3000);
+    Serial.println("EdgeForge -- {p.stem}");
+
+{sensor_init}
+
+    {resolver_adds}
+
+    tfl_model = tflite::GetModel(model_data);
+    if (tfl_model->version() != TFLITE_SCHEMA_VERSION) {{
+        Serial.println("[FAIL] Schema version mismatch");
+        while (1);
+    }}
+    interpreter = new tflite::MicroInterpreter(
+        tfl_model, resolver, tensor_arena, ARENA_SIZE
+    );
+    if (interpreter->AllocateTensors() != kTfLiteOk) {{
+        Serial.println("[FAIL] AllocateTensors failed");
+        while (1);
+    }}
+    input_tensor  = interpreter->input(0);
+    output_tensor = interpreter->output(0);
+    Serial.print("[OK] Model loaded  arena_used=");
+    Serial.println(interpreter->arena_used_bytes());
+    Serial.println("idle=still  shake=fast move  tap=knock");
+}}
+
+void loop() {{
+    {loop_body}
+}}
+
+void run_inference() {{
+{infer_fill}
+
+    unsigned long t0 = micros();
+    if (interpreter->Invoke() != kTfLiteOk) {{
+        Serial.println("[WARN] Invoke failed");
+        return;
+    }}
+    unsigned long ms = (micros() - t0) / 1000;
+
+    float *out = output_tensor->data.f;
+    int best = 0;
+    for (int i = 1; i < N_CLASSES; i++)
+        if (out[i] > out[best]) best = i;
+
+    Serial.print("[INFER] "); Serial.print(CLASS_NAMES[best]);
+    Serial.print("  (");
+    for (int i = 0; i < N_CLASSES; i++) {{
+        Serial.print(CLASS_NAMES[i]); Serial.print("="); Serial.print(out[i], 2);
+        if (i < N_CLASSES - 1) Serial.print("  ");
+    }}
+    Serial.print(")  "); Serial.print(ms); Serial.println(" ms");
+}}
+"""
+    (out / f"{sketch_name}.ino").write_text(ino_content, encoding="utf-8")
+    console.print(f"{OK} {sketch_name}.ino written (resolver: {n_ops} ops auto-detected)")
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    console.rule("Generated Files")
+    console.print(f"  {OK} model_data.h       ({len(tflite_bytes):,} bytes)")
+    console.print(f"  {OK} {sketch_name}.ino  (resolver auto-generated)")
+    console.print()
+    console.rule("Next steps (Arduino IDE)")
+    console.print(f"  1. File -> Open -> {out}/{sketch_name}.ino")
+    console.print(f"  2. Tools -> Board -> Arduino Nano 33 BLE Sense")
+    console.print(f"  3. Upload -> Serial Monitor at 115200 baud")
+    console.print()
+    console.print(f"{OK} Output: {out}")
+
 
 
 # ── edgeforge targets ────────────────────────────────────────────────────────
@@ -544,3 +1011,4 @@ def benchmark(output_dir: str, mcu: str, compiler: str):
     console.print(f"  2. Add TFLite Micro as a dependency")
     console.print(f"  3. Include validation/main.c for a ready-made test harness")
     console.print(f"  4. Flash and check UART output")
+
